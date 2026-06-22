@@ -8,7 +8,7 @@ import csv
 
 from trishula_markitdown import (
     col_letter_to_index, parse_cell_ref, format_markdown_table,
-    parse_csv, parse_xlsx, parse_docx, convert_to_markdown
+    parse_csv, parse_xlsx, parse_docx, convert_to_markdown, detect_csv_delimiter
 )
 
 class TestUtilities(unittest.TestCase):
@@ -37,23 +37,37 @@ class TestUtilities(unittest.TestCase):
         self.assertIn("| Blue Storm | +150 |", md)
         self.assertIn("| Old Yeller | +300 |", md)
 
+    def test_format_markdown_table_escapes_pipes(self):
+        rows = [
+            ["Runner | Team", "Odds"],
+            ["Blue | Storm", "+150"]
+        ]
+        md = format_markdown_table(rows)
+        self.assertIn("Runner \\| Team", md)
+        self.assertIn("Blue \\| Storm", md)
+
 class TestCSVParser(unittest.TestCase):
     def setUp(self):
-        self.temp_file = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8")
-        writer = csv.writer(self.temp_file)
-        writer.writerow(["Name", "Points", "Rebounds"])
-        writer.writerow(["LeBron James", "25", "7"])
-        writer.writerow(["Anthony Davis", "22", "12"])
-        self.temp_file.close()
+        self.temp_csv = tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8")
+        self.temp_csv.write("Name;Points;Rebounds\nLeBron James;25;7\nAnthony Davis;22;12\n;;;\n\n")
+        self.temp_csv.close()
 
     def tearDown(self):
-        os.unlink(self.temp_file.name)
+        os.unlink(self.temp_csv.name)
+
+    def test_csv_delimiter_detection(self):
+        # Verify semicolon is correctly detected
+        delim = detect_csv_delimiter(self.temp_csv.name)
+        self.assertEqual(delim, ";")
 
     def test_csv_conversion(self):
-        md = parse_csv(self.temp_file.name)
+        # Convert semi-colon delimited file
+        md = parse_csv(self.temp_csv.name)
         self.assertIn("| Name          | Points | Rebounds |", md)
         self.assertIn("| LeBron James  | 25     | 7        |", md)
         self.assertIn("| Anthony Davis | 22     | 12       |", md)
+        # Ensure trailing empty rows are trimmed
+        self.assertNotIn("|               |        |          |", md)
 
 class TestXLSXParser(unittest.TestCase):
     def setUp(self):
@@ -63,26 +77,61 @@ class TestXLSXParser(unittest.TestCase):
         
         shared_strings_xml = (
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">'
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4" uniqueCount="4">'
             '<si><t>Player</t></si>'
             '<si><t>Spread</t></si>'
             '<si><t>Team A</t></si>'
+            '<si><t>Market</t></si>'
             '</sst>'
+        )
+
+        workbook_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets>'
+            '<sheet name="OddsSheet" sheetId="1" r:id="rId1"/>'
+            '<sheet name="InfoSheet" sheetId="2" r:id="rId2"/>'
+            '</sheets>'
+            '</workbook>'
+        )
+
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
+            '</Relationships>'
         )
 
         sheet1_xml = (
             '<?xml version="1.0" encoding="utf-8"?>'
             '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
             '<sheetData>'
-            # Row 1 has cell refs
             '<row r="1">'
             '<c r="A1" t="s"><v>0</v></c>'
             '<c r="B1" t="s"><v>1</v></c>'
             '</row>'
-            # Row 2 tests sequential fallbacks (no row ref) and inlineStr cells
             '<row>'
             '<c t="s"><v>2</v></c>'
             '<c t="inlineStr"><is><t>+4.5</t></is></c>'
+            '</row>'
+            '<row>'
+            '<c t="b"><v>1</v></c>'
+            '<c t="b"><v>0</v></c>'
+            '</row>'
+            '</sheetData>'
+            '</worksheet>'
+        )
+
+        sheet2_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>'
+            '<row r="1">'
+            '<c r="A1" t="s"><v>3</v></c>'
+            '</row>'
+            '<row>'
+            '<c t="inlineStr"><is><t>Pinnacle</t></is></c>'
             '</row>'
             '</sheetData>'
             '</worksheet>'
@@ -90,17 +139,25 @@ class TestXLSXParser(unittest.TestCase):
 
         with zipfile.ZipFile(self.temp_xlsx.name, "w") as z:
             z.writestr("xl/sharedStrings.xml", shared_strings_xml)
+            z.writestr("xl/workbook.xml", workbook_xml)
+            z.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
             z.writestr("xl/worksheets/sheet1.xml", sheet1_xml)
+            z.writestr("xl/worksheets/sheet2.xml", sheet2_xml)
 
     def tearDown(self):
         os.unlink(self.temp_xlsx.name)
 
     def test_xlsx_conversion(self):
         md = parse_xlsx(self.temp_xlsx.name)
-        # Check standard cells
+        # Check Sheet 1 output and header
+        self.assertIn("## Sheet: OddsSheet", md)
         self.assertIn("| Player | Spread |", md)
-        # Check sequential row parsing + inlineStr
         self.assertIn("| Team A | +4.5   |", md)
+        self.assertIn("| TRUE   | FALSE  |", md)
+        # Check Sheet 2 output and header
+        self.assertIn("## Sheet: InfoSheet", md)
+        self.assertIn("| Market   |", md)
+        self.assertIn("| Pinnacle |", md)
 
 class TestDOCXParser(unittest.TestCase):
     def setUp(self):
@@ -112,39 +169,80 @@ class TestDOCXParser(unittest.TestCase):
             '<?xml version="1.0" encoding="utf-8"?>'
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="http://trishula.local"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>'
             '</Relationships>'
         )
 
         document_xml = (
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
             '<w:body>'
             '<w:p>'
-            '<w:r>'
-            '<w:rPr><w:b/></w:rPr>'
-            '<w:t>Sovereign System Briefing</w:t>'
-            '</w:r>'
+            '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            '<w:r><w:t>Sovereign System Briefing</w:t></w:r>'
             '</w:p>'
-            # Paragraph with nested hyperlinks and breaks
+            # List item 1 (w:ilvl = 0)
+            '<w:p>'
+            '<w:pPr>'
+            '<w:numPr>'
+            '<w:ilvl w:val="0"/>'
+            '<w:numId w:val="1"/>'
+            '</w:numPr>'
+            '</w:pPr>'
+            '<w:r><w:t>Bullet Level 0</w:t></w:r>'
+            '</w:p>'
+            # List item 2 (w:ilvl = 1)
+            '<w:p>'
+            '<w:pPr>'
+            '<w:numPr>'
+            '<w:ilvl w:val="1"/>'
+            '<w:numId w:val="1"/>'
+            '</w:numPr>'
+            '</w:pPr>'
+            '<w:r><w:t>Bullet Level 1</w:t></w:r>'
+            '</w:p>'
+            # Strikethrough & Underline
             '<w:p>'
             '<w:r>'
-            '<w:t>This is line 1.</w:t>'
-            '<w:br/>'
-            '<w:t>Line 2 leads to </w:t>'
+            '<w:rPr><w:strike/></w:rPr>'
+            '<w:t>Deleted Text</w:t>'
             '</w:r>'
-            '<w:hyperlink r:id="rId1">'
             '<w:r>'
-            '<w:t>Trishula Home</w:t>'
+            '<w:rPr><w:u w:val="single"/></w:rPr>'
+            '<w:t>Underlined Text</w:t>'
             '</w:r>'
+            '</w:p>'
+            # Drawing/Image
+            '<w:p>'
+            '<w:r>'
+            '<w:drawing>'
+            '<a:blip r:embed="rId2"/>'
+            '</w:drawing>'
+            '</w:r>'
+            '</w:p>'
+            # Hyperlink & Anchor
+            '<w:p>'
+            '<w:hyperlink r:id="rId1">'
+            '<w:r><w:t>Trishula Home</w:t></w:r>'
+            '</w:hyperlink>'
+            '<w:hyperlink w:anchor="section2">'
+            '<w:r><w:t>Go to Sec 2</w:t></w:r>'
             '</w:hyperlink>'
             '</w:p>'
+            # Table with spans & pipes
             '<w:tbl>'
             '<w:tr>'
             '<w:tc>'
-            '<w:p><w:r><w:t>Col 1</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>Header A | B</w:t></w:r></w:p>'
             '</w:tc>'
             '<w:tc>'
-            '<w:p><w:r><w:t>Col 2</w:t></w:r></w:p>'
+            '<w:p><w:r><w:t>Header C</w:t></w:r></w:p>'
+            '</w:tc>'
+            '</w:tr>'
+            '<w:tr>'
+            '<w:tc>'
+            '<w:tcPr><w:gridSpan w:val="2"/></w:tcPr>'
+            '<w:p><w:r><w:t>Span Cell</w:t></w:r></w:p>'
             '</w:tc>'
             '</w:tr>'
             '</w:tbl>'
@@ -161,14 +259,22 @@ class TestDOCXParser(unittest.TestCase):
 
     def test_docx_conversion(self):
         md = parse_docx(self.temp_docx.name)
-        # Check bold text rendering
-        self.assertIn("**Sovereign System Briefing**", md)
-        # Check paragraph breaks (double spaces)
-        self.assertIn("This is line 1.  \nLine 2 leads to", md)
+        # Check heading style
+        self.assertIn("# Sovereign System Briefing", md)
+        # Check bullet item rendering and indentation
+        self.assertIn("- Bullet Level 0\n  - Bullet Level 1", md)
+        # Check strike & underline styles
+        self.assertIn("~~Deleted Text~~", md)
+        self.assertIn("<u>Underlined Text</u>", md)
+        # Check image parsing
+        self.assertIn("![Image](image1.png)", md)
         # Check resolved hyperlinks
         self.assertIn("[Trishula Home](http://trishula.local)", md)
-        # Check table rendering
-        self.assertIn("| Col 1 | Col 2 |", md)
+        # Check bookmark anchor link
+        self.assertIn("[Go to Sec 2](#section2)", md)
+        # Check table pipe escaping and cell merging (span)
+        self.assertIn("Header A \\| B", md)
+        self.assertIn("Span Cell", md)
 
 class TestFormatRouter(unittest.TestCase):
     @patch("os.path.exists")
